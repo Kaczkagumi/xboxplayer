@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-ASSET-BASED MUSIC PLAYER (Innioasis / Rockbox style)
+INNIOASIS THEME COMPATIBLE MUSIC PLAYER
 240x240 SPI display | python3-pygame | Raspberry Pi Zero W
+Parses native Innioasis Y1 themes (config.json, desk_bg001.png, 1.png, etc.)
 """
 
 import pygame
@@ -34,51 +35,76 @@ class Repeat(Enum):
     ALL = auto()
     ONE = auto()
 
-# ── Theme Engine ───────────────────────────────────────────────────────────────
+# ── Innioasis Theme Engine ─────────────────────────────────────────────────────
 class Theme:
     def __init__(self, path):
         self.path = Path(path)
         
-        # Default config
+        # Domyślny fallback, jeśli brakuje config.json
         self.cfg = {
             "name": self.path.name,
-            "color_text": (220, 220, 220),
-            "color_sel": (255, 255, 255),
-            "color_dim": (120, 120, 120),
-            "color_prog_bg": (40, 40, 40),
-            "color_prog_fg": (100, 200, 255),
-            "font_size": 14
+            "desktopWallpaper": "desk_bg001.png",
+            "fontFamily": None,
+            "textColor": "#FFFFFF",
+            "selectColor": "#00FF00"
         }
         
-        # Load theme.json
-        cfg_file = self.path / "theme.json"
+        # 1. Wczytywanie natywnego pliku Innioasis: config.json
+        cfg_file = self.path / "config.json"
         if cfg_file.exists():
             try:
-                with open(cfg_file) as f:
+                with open(cfg_file, 'r', encoding='utf-8') as f:
                     self.cfg.update(json.load(f))
-            except Exception as e: print(f"Error loading {cfg_file}: {e}")
+            except Exception as e:
+                print(f"Błąd ładowania config.json z {self.path.name}: {e}")
                 
-        # Load images (returns transparent surface if missing)
-        self.bg = self._load_img("bg.png", (SW, SH))
-        self.topbar = self._load_img("topbar.png", (SW, 20))
-        self.sel = self._load_img("sel.png", (SW, 26))
-        self.batt = self._load_img("battery.png", (24, 12))
+        # 2. Parsowanie kolorów (Innioasis używa HEX lub tablic [R,G,B])
+        self.txt_col = self._parse_color(self.cfg.get("textColor", "#FFFFFF"))
+        self.sel_col = self._parse_color(self.cfg.get("selectColor", "#00FF00"))
         
-        # Load font
-        font_file = self.path / "font.ttf"
-        fs = self.cfg["font_size"]
-        if font_file.exists():
-            self.fnt_main = pygame.font.Font(str(font_file), fs)
-            self.fnt_sub = pygame.font.Font(str(font_file), max(8, fs - 2))
+        # 3. Ładowanie grafik w standardzie Innioasis
+        bg_name = self.cfg.get("desktopWallpaper", "desk_bg001.png")
+        self.bg = self._load_img(bg_name, (SW, SH))          # Tło zdefiniowane w JSON
+        self.sel = self._load_img("1.png", (SW, 26))         # Innioasis highlight belka
+        self.cover = self._load_img("cover.png", (SW, SH))   # Podgląd motywu do zakładki OPTIONS
+        self.topbar = self._load_img("topbar.png", (SW, 20)) # Opcjonalnie
+        
+        # 4. Ładowanie czcionki .ttf
+        font_file = self.cfg.get("fontFamily")
+        if not font_file or not (self.path / font_file).exists():
+            # Fallback: znajdź jakikolwiek plik ttf w folderze motywu
+            ttfs = list(self.path.glob("*.ttf"))
+            font_file = ttfs[0].name if ttfs else None
+            
+        fs = 14 # Domyślny rozmiar
+        if font_file:
+            try:
+                self.fnt_main = pygame.font.Font(str(self.path / font_file), fs)
+                self.fnt_sub = pygame.font.Font(str(self.path / font_file), max(10, fs - 2))
+            except:
+                self._fallback_fonts(fs)
         else:
-            self.fnt_main = pygame.font.SysFont("dejavusans", fs)
-            self.fnt_sub = pygame.font.SysFont("dejavusans", max(8, fs - 2))
+            self._fallback_fonts(fs)
+
+    def _fallback_fonts(self, fs):
+        self.fnt_main = pygame.font.SysFont("dejavusans", fs)
+        self.fnt_sub = pygame.font.SysFont("dejavusans", max(10, fs - 2))
+
+    def _parse_color(self, c):
+        if isinstance(c, list) and len(c) >= 3:
+            return tuple(c[:3])
+        if isinstance(c, str):
+            c = c.strip().lstrip('#')
+            if len(c) == 6:
+                return tuple(int(c[i:i+2], 16) for i in (0, 2, 4))
+        return (255, 255, 255)
 
     def _load_img(self, name, size):
         p = self.path / name
         if p.exists():
-            try: return pygame.image.load(str(p)).convert_alpha()
+            try: return pygame.transform.scale(pygame.image.load(str(p)).convert_alpha(), size)
             except: pass
+        # Jeśli grafiki brakuje, stwórz przezroczystą płachtę
         return pygame.Surface(size, pygame.SRCALPHA)
 
 def load_themes(themes_dir="themes"):
@@ -88,7 +114,7 @@ def load_themes(themes_dir="themes"):
     if not themes:
         (p / "Default").mkdir(exist_ok=True)
         themes.append(Theme(p / "Default"))
-    return themes
+    return sorted(themes, key=lambda x: x.cfg.get("name", ""))
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def trunc(font, text, max_w):
@@ -257,12 +283,12 @@ class MusicPlayer:
         elif self.cursor >= self.scroll + vis: self.scroll = self.cursor - vis + 1
         self.scroll = max(0, min(self.scroll, max(0, count - vis)))
 
-    # ── Asset-based Rendering ──────────────────────────────────────────────────────
+    # ── Rendering ──────────────────────────────────────────────────────────────────
     def _draw_topbar(self, title):
+        # Rysuje górny pasek. Jeśli motyw go nie ma, użyje pustej przestrzeni.
         self.surf.blit(self.th.topbar, (0, 0))
-        self.surf.blit(self.th.batt, (SW - self.th.batt.get_width() - 5, 4))
-        ts = self.th.fnt_sub.render(title, True, self.th.cfg["color_text"])
-        self.surf.blit(ts, (5, 2))
+        ts = self.th.fnt_sub.render(title, True, self.th.txt_col)
+        self.surf.blit(ts, (10, 2))
 
     def _draw_tabs(self):
         tabs = [("NOW", Screen.NOW_PLAYING), ("LIB", Screen.LIBRARY), 
@@ -270,14 +296,18 @@ class MusicPlayer:
         y = SH - 20
         sw = SW // len(tabs)
         
-        # Tabs background (if no custom asset, draw simple dark box)
-        pygame.draw.rect(self.surf, (0,0,0, 150), (0, y, SW, 20))
+        # Prosty overlay dla czytelności zakładek, żeby tło z motywu nie zlewało się z tekstem
+        pygame.draw.rect(self.surf, (0, 0, 0, 180), (0, y, SW, 20))
         
         for i, (name, sid) in enumerate(tabs):
             x = i * sw
             active = (self.screen_id == sid) or (self.screen_id == Screen.PLAYLIST_VIEW and sid == Screen.PLAYLISTS)
-            col = self.th.cfg["color_text"] if active else self.th.cfg["color_dim"]
-            lbl = self.th.fnt_sub.render(name, True, col)
+            
+            # Subtelne podkreślenie aktualnej zakładki kolorem motywu
+            if active:
+                pygame.draw.rect(self.surf, self.th.sel_col, (x, y+18, sw, 2))
+                
+            lbl = self.th.fnt_sub.render(name, True, self.th.txt_col)
             self.surf.blit(lbl, (x + sw//2 - lbl.get_width()//2, y + 2))
 
     def _draw_now_playing(self):
@@ -289,7 +319,7 @@ class MusicPlayer:
             
             # Title Marquee
             max_w = SW - 20
-            ts = self.th.fnt_main.render(t["title"], True, self.th.cfg["color_text"])
+            ts = self.th.fnt_main.render(t["title"], True, self.th.txt_col)
             clip_r = pygame.Rect(10, 80, max_w, 30)
             self.surf.set_clip(clip_r)
             if ts.get_width() > max_w:
@@ -300,27 +330,25 @@ class MusicPlayer:
             self.surf.set_clip(None)
             
             # Artist
-            art = self.th.fnt_sub.render(trunc(self.th.fnt_sub, t["artist"], max_w), True, self.th.cfg["color_dim"])
+            art = self.th.fnt_sub.render(trunc(self.th.fnt_sub, t["artist"], max_w), True, self.th.txt_col)
             self.surf.blit(art, (10, 110))
             
-            # Progress Bar
+            # Progress Bar (Używa sel_col jako dominującego akcentu)
             py = 140
-            pygame.draw.rect(self.surf, self.th.cfg["color_prog_bg"], (10, py, SW-20, 8), border_radius=4)
+            pygame.draw.rect(self.surf, (40, 40, 40), (10, py, SW-20, 4), border_radius=2)
             if self.duration > 0:
                 fw = int((SW-20) * (self.pos_sec / self.duration))
-                pygame.draw.rect(self.surf, self.th.cfg["color_prog_fg"], (10, py, fw, 8), border_radius=4)
+                pygame.draw.rect(self.surf, self.th.sel_col, (10, py, fw, 4), border_radius=2)
             
-            # Time text
             s = int(self.pos_sec); d = int(self.duration)
             tm_str = f"{s//60}:{s%60:02d} / {d//60}:{d%60:02d}"
-            tm_s = self.th.fnt_sub.render(tm_str, True, self.th.cfg["color_dim"])
-            self.surf.blit(tm_s, (SW//2 - tm_s.get_width()//2, 155))
+            tm_s = self.th.fnt_sub.render(tm_str, True, self.th.txt_col)
+            self.surf.blit(tm_s, (SW//2 - tm_s.get_width()//2, 150))
             
-            # Status
             stat = "▶" if (self.playing and not self.paused) else "⏸" if self.paused else "■"
-            modes = f"SHF: {'On' if self.shuffle else 'Off'} | RPT: {self.repeat.name}"
-            st = self.th.fnt_sub.render(f"{stat}  {modes}", True, self.th.cfg["color_dim"])
-            self.surf.blit(st, (SW//2 - st.get_width()//2, 180))
+            modes = f"SHF: {'ON' if self.shuffle else 'OFF'} | RPT: {self.repeat.name}"
+            st = self.th.fnt_sub.render(f"{stat}  {modes}", True, self.th.txt_col)
+            self.surf.blit(st, (SW//2 - st.get_width()//2, 175))
 
         self._draw_tabs()
 
@@ -338,21 +366,29 @@ class MusicPlayer:
             ry = y0 + i * self.ROW_H
             sel = (idx == self.cursor)
             
+            # Natywny znacznik wyboru Innioasis (1.png)
             if sel: self.surf.blit(self.th.sel, (0, ry))
             
             name = t["title"] if isinstance(t, dict) else t
-            col = self.th.cfg["color_sel"] if sel else self.th.cfg["color_text"]
-            ts = self.th.fnt_main.render(trunc(self.th.fnt_main, name, SW-10), True, col)
+            ts = self.th.fnt_main.render(trunc(self.th.fnt_main, name, SW-10), True, self.th.txt_col)
             self.surf.blit(ts, (10, ry + 4))
 
         self._draw_tabs()
 
     def _draw_options(self):
-        self.surf.blit(self.th.bg, (0, 0))
+        # Jeśli motyw ma plik cover.png (podgląd), pokaż go jako tło opcji. Jak nie, użyj zwykłego bg.
+        bg_surface = self.th.cover if self.th.cover.get_alpha() is not None else self.th.bg
+        self.surf.blit(bg_surface, (0, 0))
+        
+        # Półprzezroczysty overlay by opcje były czytelne
+        overlay = pygame.Surface((SW, SH), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 160))
+        self.surf.blit(overlay, (0, 0))
+        
         self._draw_topbar("OPTIONS")
         
         opts = [
-            ("Theme", self.th.cfg["name"]),
+            ("Theme", self.th.cfg.get("name", "Unknown")),
             ("Shuffle", "ON" if self.shuffle else "OFF"),
             ("Repeat", self.repeat.name)
         ]
@@ -363,10 +399,11 @@ class MusicPlayer:
         for i, (k, v) in enumerate(opts):
             ry = y0 + i * 40
             sel = (i == self.cursor)
+            
             if sel: self.surf.blit(self.th.sel, (0, ry))
             
-            ks = self.th.fnt_sub.render(k, True, self.th.cfg["color_dim"])
-            vs = self.th.fnt_main.render(v, True, self.th.cfg["color_sel"] if sel else self.th.cfg["color_text"])
+            ks = self.th.fnt_sub.render(k, True, self.th.txt_col)
+            vs = self.th.fnt_main.render(v, True, self.th.txt_col)
             self.surf.blit(ks, (10, ry + 8))
             self.surf.blit(vs, (SW - 10 - vs.get_width(), ry + 4))
 
@@ -454,4 +491,4 @@ class MusicPlayer:
             self.clock.tick(FPS)
 
 if __name__ == "__main__":
-    MusicPlayer(window_mode=True).run()
+    MusicPlayer(window_mode=True).run() # Ustaw window_mode=False dla Pi
